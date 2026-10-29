@@ -46,7 +46,7 @@ static char gLabBuf[LAB_MAX];
 
 SYSCTL_DECL(_kern);
 SYSCTL_STRING(_kern, OID_AUTO, latsof_lab,
-              CTLFLAG_RW | CTLFLAG_ANYBODY,
+              CTLFLAG_RW,   /* ACER: root only (was CTLFLAG_ANYBODY) */
               gLabBuf, sizeof(gLabBuf), "LatSOF lab parameters");
 static bool gLabOidRegistered = false;
 
@@ -278,21 +278,29 @@ static bool   gLabHoldOff = false;     // this initDSP() call held off hardware
 //    kern.latsof_lab="") returns to auto mode. Any other explicit string
 //    remains a one-shot lab run, identical to pre-patch-67 semantics.
 #define LATSOF_PROD_LAB \
-    "enable=1 stage=0 trigger=1 coupled=0 sidx=7 tag=1 hdaInit=0 " \
-    "prefwrun=1 pie=1 steal=1 strictborrow=0 tmax=3000"
+    "enable=1 stage=0 trigger=1 coupled=0 hdaInit=0 " \
+    "prefwrun=1 pie=1 strictborrow=0 tmax=3000 pciGate=1"
+// ACER RPL profile, verified twice (FW_ENTERED ~20 ms, IPC OK, topology 8/8):
+//  - no sidx: the loader takes the first free playback SD (SD8 when AppleHDA holds SD7);
+//  - no tag=1: the ROM is told that SD's natural tag (Linux: index - ISS + 1). tag=1 on SD8
+//    left the ROM at 0x05000001 waiting on SD7's channel;
+//  - no steal: nothing to free once the tag follows the stream;
+//  - pciGate=1: Linux hda_dsp_ctrl_clock_power_gating(false) before the boot.
 // hdaInit=0 (2026-10-02 20:05 verified): loads the firmware WITHOUT the
 // CORB/RIRB hijack — and AppleHDA playback survives the load. hdaInit=3
 // (the debugging-era winning value) desyncs AppleHDA's codec command
 // channel: 58 in-flight verbs get answered into our RIRB, its state machine
 // wedges, its output StartIO blocks forever inside an AppleHDAController
 // mutex (spindump: 100/101 samples) — the VoiceMemos machine freeze.
-static UInt32 gLabAuto = 1;            // 1 = production auto mode (default)
+// ACER RPL v4: auto mode is the default again (the profile above is verified here).
+// Fuses: boot-arg latsof_auto=0 (parked), -latsofoff (no start), sysctl "auto=0".
+static UInt32 gLabAuto = 1;            // 1 = production auto mode
 // patch-68 fix: the boot-arg latsof-auto baseline. labReload() used to stomp
 // gLabAuto with the sysctl-string default on every reload — an empty buffer
 // has no "auto=" key, so the parse default (1) always won and the boot-arg
 // never survived past the first engine tick. The sysctl key now only applies
 // when actually present; otherwise the boot-arg baseline holds.
-static UInt32 gLabAutoBoot = 1;
+static UInt32 gLabAutoBoot = 1;        // ACER RPL v4: auto (see gLabAuto)
 // patch-68: initDSP holds the audio command gate for up to LAB_TMAX_CAP ms
 // and rewrites global controller state. A second concurrent call — from a
 // playback IPC-timeout path, a UserClient probe, anything — used to be
@@ -937,7 +945,18 @@ static int outputSdBusyState(volatile UInt8 *hda, UInt16 *gcapOut = nullptr) {
 #define kAfgBeltTicks       20      // RUN belt check: every 20th 500 ms tick
 #define kAfgIciFailLimit    8       // consecutive ICI failures -> retire
 
-static bool gAfgKextWake  = true;   // boot-arg latsof_afgwake=0 disables
+// ACER RPL: host-managed DSP cores (Linux chip_info.host_managed_cores_mask):
+// CNL/CML GENMASK(3,0), TGL/RPL BIT(0). Set in start() from the device ID.
+static UInt32 gHostCores = 0xF;
+// ACER RPL v5: platform power management once the DSP is up, as Linux does in
+// hda_dsp_post_fw_run(): DSP clock gating on (PCI 0x48 bit 1), DSP power gating
+// allowed (PCI 0x44 bit 2 = 0), DMI L1 on (EM2 L1SEN) - and DMI L1 off only while
+// our DMIC stream runs, because that host stream is not DMI-L1 compatible
+// (hda-stream.c). Before this, the pre-boot "gating off" of pciGate stayed for the
+// whole session, DMI L1 of AppleHDA's controller included. Lab knob pmlinux=0
+// keeps that v4 state, for A/B power measurements.
+static int gPmApplied = -1;   // -1 unknown (after any init), 0 v4 state, 1 Linux
+static bool gAfgKextWake  = false;  // ACER RPL: off (ALC257-specific); boot-arg latsof_afgwake=1 enables
 static int  gAfgLastSd    = -2;     // last outputSdBusyState (-2 = unseen)
 static UInt32 gAfgLastSig = 0;      // last BDL^CBL^FMT signature of SD7
 static int  gAfgSenseTick = 0;      // jack-sense poll divider
@@ -1087,7 +1106,16 @@ IOService *LatSOFAudioDevice::probe(IOService *provider, SInt32 *score) {
 bool LatSOFAudioDevice::start(IOService *provider) {
     IOLog("LatSOF: start() entered, provider=%s\n",
           provider ? provider->getName() : "(null)");
+    if (PE_parse_boot_argn("-latsofoff", nullptr, 0)) {   // ACER RPL: escape hatch
+        IOLog("LatSOF: -latsofoff in boot-args - not starting\n");
+        return false;
+    }
     if (!IOService::start(provider)) { IOLog("LatSOF: super::start failed\n"); return false; }
+    // ACER RPL: the lab sysctl is the only way to arm a parked kext, so it must
+    // exist whatever start() decides below. It used to be registered only by
+    // initDSP(), which a load deferred by AppleHDA's programmed SD7 never calls
+    // (measured 29/10 00:17: "unknown oid 'kern.latsof_lab'").
+    labRegister();
     // LATITUDE FORK: we are not this device's driver. AppleHDA owns it and
     // must keep owning it, so we locate the controller in the registry and
     // never call open().
@@ -1101,13 +1129,16 @@ bool LatSOFAudioDevice::start(IOService *provider) {
                 IOPCIDevice *c = OSDynamicCast(IOPCIDevice, o);
                 if (!c) continue;
                 if (c->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
-                    c->configRead16(kIOPCIConfigDeviceID) == 0x02c8) {
+                    (c->configRead16(kIOPCIConfigDeviceID) == 0x02c8 ||
+                     c->configRead16(kIOPCIConfigDeviceID) == 0x51ca)) {   // ACER RPL: 51CA
                     pciDevice = c; pciDevice->retain(); break;
                 }
             }
             it->release();
         }
     }
+    if (pciDevice && pciDevice->configRead16(kIOPCIConfigDeviceID) == 0x51ca)
+        gHostCores = 0x1;   // ACER RPL: tgl_chip_info.host_managed_cores_mask = BIT(0)
     if (!pciDevice) { setProperty("Status", "FAILED: cAVS not found"), IOLog("LatSOF: %s\n", "FAILED: cAVS not found"); return false; }
     IOLog("LatSOF: found cAVS: %s\n", pciDevice->getName());
     // NOTE: no pciDevice->open() — AppleHDA holds it.
@@ -1117,16 +1148,8 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     pciDevice->setMemoryEnable(true);
     // LATITUDE FORK: D3->D0 power cycle removed (AppleHDA owns power state)
 
-    // TCSEL: clear TC bits [2:0] to TC0 (like Linux snd_intel_dsp_driver_probe)
-    {
-        UInt8 tcsel = pciDevice->configRead8(PCI_TCSEL);
-        pciDevice->configWrite8(PCI_TCSEL, tcsel & ~0x07);
-    }
-    // Disable PCI interrupt (CMD bit 10)
-    {
-        UInt16 cmd = pciDevice->configRead16(0x04);
-        pciDevice->configWrite16(0x04, cmd | 0x0400);
-    }
+    // ACER RPL: TCSEL and the INTx disable moved to initDSP, after the armed
+    // gate, so a parked load writes nothing to AppleHDA's function.
 
     hdaBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     dspBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4);
@@ -1703,6 +1726,14 @@ bool LatSOFAudioDevice::initDSP() {
     if (!gLabAuto) gLabGenDone = gLabGen;    // consume this generation: exactly one run
     IOLog("LatSOF: lab ARMED gen=%u raw=\"%s\"\n", gLabGen,
           gLabBuf[0] ? gLabBuf : "(empty)");
+    // ACER RPL: moved here from start(). TCSEL to TC0 as Linux does; INTx off is
+    // harmless because AppleHDA runs this function in MSI mode (IOPCIMSIMode).
+    if (pciDevice) {
+        UInt8 tcsel = pciDevice->configRead8(PCI_TCSEL);
+        pciDevice->configWrite8(PCI_TCSEL, tcsel & ~0x07);
+        UInt16 cmd = pciDevice->configRead16(0x04);
+        pciDevice->configWrite16(0x04, cmd | 0x0400);
+    }
     // ================================================================
 
     // LATITUDE FORK patch-17: restore D0 before reading anything.
@@ -2151,7 +2182,7 @@ bool LatSOFAudioDevice::initDSP() {
         // hits a listening codec. The mid-flow POR is skipped when this ran.
         bool porFirstDone = false;
         if (labU32("porfirst", 0) && labU32("prefwrun", 0)) {
-            UInt32 hm  = 0xF;                 // host_managed_cores_mask (CNL/CML)
+            UInt32 hm  = gHostCores;          // host_managed_cores_mask (ACER RPL: per chip)
             UInt32 pre = rd32(dsp, DSP_ADSPCS);
             if (pre & ADSPCS_CPA(hm)) {
                 UInt32 c = pre;
@@ -2438,10 +2469,10 @@ bool LatSOFAudioDevice::initDSP() {
         // =======================================================================
 
         // DSP reset + power up
-        wr32(dsp, DSP_ADSPCS, rd32(dsp, DSP_ADSPCS) | ADSPCS_CRST(0xF) | ADSPCS_CSTALL(0xF));
+        wr32(dsp, DSP_ADSPCS, rd32(dsp, DSP_ADSPCS) | ADSPCS_CRST(gHostCores) | ADSPCS_CSTALL(gHostCores));
         IODelay(1000);
-        wr32(dsp, DSP_ADSPCS, rd32(dsp, DSP_ADSPCS) | ADSPCS_SPA(0xF));
-        if (!poll32(dsp, DSP_ADSPCS, ADSPCS_CPA(0xF), ADSPCS_CPA(0xF), 50000)) {
+        wr32(dsp, DSP_ADSPCS, rd32(dsp, DSP_ADSPCS) | ADSPCS_SPA(gHostCores));
+        if (!poll32(dsp, DSP_ADSPCS, ADSPCS_CPA(gHostCores), ADSPCS_CPA(gHostCores), 50000)) {
             setProperty("Status", "FAILED: core power"), IOLog("LatSOF: %s\n", "FAILED: core power");
             goto done;
         }
@@ -2862,7 +2893,7 @@ bool LatSOFAudioDevice::initDSP() {
         // Knob `prefwrun=1`. Non-destructive to AppleHDA (ADSPCS is BAR4).
         {
             UInt32 por = labU32("prefwrun", 0);
-            UInt32 hm  = 0xF;                     // host_managed_cores_mask (CNL/CML)
+            UInt32 hm  = gHostCores;              // host_managed_cores_mask (ACER RPL: per chip)
             UInt32 pre = rd32(dsp, DSP_ADSPCS);
             if (por && !porFirstDone) {           // patch-63: skipped when porfirst ran it
                 // ---- hda_dsp_core_reset_power_down(0xF) ----
@@ -2960,9 +2991,10 @@ bool LatSOFAudioDevice::initDSP() {
         }
         wr32(dsp, IPC_HIPCIDA, rd32(dsp, IPC_HIPCIDA) | IPC_DONE);
 
-        // Power down cores 1-3, enable IPC interrupts
-        { UInt32 a = rd32(dsp, DSP_ADSPCS);
-          a |= ADSPCS_CRST(0xE) | ADSPCS_CSTALL(0xE); a &= ~ADSPCS_SPA(0xE);
+        // Power down the host-managed cores other than core 0, enable IPC interrupts
+        // (ACER RPL: none on TGL/RPL, where only core 0 is host-managed)
+        if (gHostCores & ~1U) { UInt32 a = rd32(dsp, DSP_ADSPCS), m = gHostCores & ~1U;
+          a |= ADSPCS_CRST(m) | ADSPCS_CSTALL(m); a &= ~ADSPCS_SPA(m);
           wr32(dsp, DSP_ADSPCS, a); }
         wr32(dsp, IPC_HIPCCTL, 0x03);
         wr32(dsp, DSP_ADSPIC, rd32(dsp, DSP_ADSPIC) | 0x01);
@@ -3709,8 +3741,9 @@ bool LatSOFAudioDevice::initDSP() {
                 // sleep. GCAP says 7 input streams (SD0-SD6); AppleHDA
                 // allocates from the bottom, so SD6 collides only if seven
                 // input engines run at once. Tag follows idx+1 convention.
-                this->capIdx = 6; this->capTag = 7;
-                this->capSd = SD_BASE + 6 * SD_SIZE;
+                this->capIdx = (numISS > 0) ? numISS - 1 : 6;   // ACER RPL: last input SD from GCAP
+                this->capTag = (UInt32)this->capIdx + 1;
+                this->capSd = SD_BASE + (UInt32)this->capIdx * SD_SIZE;
                 this->outboxOff = outboxOff;
                 hwReady = true; isPlaying = false; isCapturing = false; activePlaybackHost = PIPE1_HOST_ID;
 
@@ -3927,11 +3960,11 @@ void LatSOFAudioDevice::shutdownDSPGated() {
 
     // Power down DSP cores: stall + reset + remove power
     { UInt32 a = rd32(dspBase, DSP_ADSPCS);
-      a |= ADSPCS_CRST(0xF) | ADSPCS_CSTALL(0xF);
-      a &= ~ADSPCS_SPA(0xF);
+      a |= ADSPCS_CRST(gHostCores) | ADSPCS_CSTALL(gHostCores);
+      a &= ~ADSPCS_SPA(gHostCores);
       wr32(dspBase, DSP_ADSPCS, a);
     }
-    poll32(dspBase, DSP_ADSPCS, ADSPCS_CPA(0xF), 0, 50000);
+    poll32(dspBase, DSP_ADSPCS, ADSPCS_CPA(gHostCores), 0, 50000);
 
     // LATITUDE FORK patch-25: everything above this point is BAR4 — the DSP,
     // which is exclusively ours. What used to follow was three writes to
@@ -4182,6 +4215,10 @@ IOReturn LatSOFAudioDevice::sPowerInterestHandler(void *target, void *refCon,
 }
 
 void LatSOFAudioDevice::stop(IOService *provider) {
+    if (gLabOidRegistered) {   // ACER RPL: never leave the oid pointing into an unloaded kext
+        sysctl_unregister_oid(&sysctl__kern_latsof_lab);
+        gLabOidRegistered = false;
+    }
     if (powerNotifier) {
         powerNotifier->remove();
         powerNotifier = nullptr;
@@ -4248,7 +4285,55 @@ void LatSOFAudioDevice::stop(IOService *provider) {
 
 // ==================== Jack Detection Polling ====================
 
+// ACER RPL v5: see gPmApplied. Read-modify-write only; EM2 is shared with AppleHDA,
+// whose own value before this driver had L1SEN set (0x84806000).
+static void applyPlatformPm(IOPCIDevice *pci, volatile UInt8 *hda, bool linuxPm, bool capturing) {
+    UInt8 cg = pci->configRead8(0x48), pg = pci->configRead8(0x44);
+    UInt32 em2 = rd32(hda, HDA_VS_EM2);
+    if (linuxPm) { cg |= 0x02; pg &= (UInt8)~0x04; if (!capturing) em2 |= 0x2000U; }
+    else         { cg &= (UInt8)~0x02; pg |= 0x04; em2 &= ~0x2000U; }
+    pci->configWrite8(0x48, cg);
+    pci->configWrite8(0x44, pg);
+    *(volatile UInt32 *)(hda + HDA_VS_EM2) = em2;
+}
+
 void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
+    // ACER RPL: parked by default, so a sysctl write alone must be able to arm a
+    // run. Once per new lab generation (never in a loop): raise the retry engine.
+    {
+        static UInt32 armGenSeen = 0;
+        if (!gWakeReinitPending && !hwReady && pciDevice && hdaBase && dspBase) {
+            labReload();
+            if (gLabGen != armGenSeen) {
+                armGenSeen = gLabGen;
+                if (gLabEnable) {
+                    gWakeReinitPending = true;
+                    gWakeTries = 0; gWakeTickDivider = 0; gProgrammedWaits = 0;
+                    IOLog("LatSOF: new lab string gen=%u - retry engine armed\n", gLabGen);
+                }
+            }
+        }
+    }
+    // ACER RPL v5: platform PM (gPmApplied). Applied once the DSP is up and no init
+    // is running; a knob change (sysctl pmlinux=0/1) is picked up within a tick.
+    if (!hwReady) {
+        gPmApplied = -1;   // every init turns the gating off again (pciGate)
+    } else if (pciDevice && hdaBase && !gInitInProgress) {
+        int want = labU32("pmlinux", 1) ? 1 : 0;
+        if (want != gPmApplied) {
+            applyPlatformPm(pciDevice, hdaBase, want != 0, isCapturing);
+            gPmApplied = want;
+            char pm[96];
+            snprintf(pm, sizeof(pm), "%s: PCI48=0x%02x PCI44=0x%02x EM2=0x%08x",
+                     want ? "linux" : "off (v4)", pciDevice->configRead8(0x48),
+                     pciDevice->configRead8(0x44), rd32(hdaBase, HDA_VS_EM2));
+            setProperty("PM-Gating", pm);
+            IOLog("LatSOF: PM-Gating %s\n", pm);
+        } else if (want && !isCapturing && !(rd32(hdaBase, HDA_VS_EM2) & 0x2000U)) {
+            // a capture start that failed after clearing L1SEN: give DMI L1 back
+            *(volatile UInt32 *)(hdaBase + HDA_VS_EM2) = rd32(hdaBase, HDA_VS_EM2) | 0x2000U;
+        }
+    }
     // LATITUDE FORK patch-22: wake re-init retry engine. Lives here because
     // this timer already fires every 500 ms on the workloop regardless of
     // hwReady — exactly the cadence and exclusion context needed.
@@ -4891,6 +4976,9 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
     }
     if (isCapturing) return kIOReturnSuccess;
 
+    // ACER RPL v5: DMI L1 off while our stream runs (Linux: not DMI-L1 compatible)
+    if (gPmApplied == 1) wr32(hdaBase, HDA_VS_EM2, rd32(hdaBase, HDA_VS_EM2) & ~0x2000U);
+
     UInt32 numBdl = (kLatSOF_CapBufferSize + PAGE_SIZE - 1) / PAGE_SIZE;
     UInt32 paramsErr = 0, trigErr = 0, posnOff = 0;  // LATITUDE FORK: real IPC replies
 
@@ -5099,6 +5187,8 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
                     rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
 
     bzero(capDmaBuf->getBytesNoCopy(), kLatSOF_CapBufferSize);
+    // ACER RPL v5: DMI L1 back on once our stream is gone
+    if (gPmApplied == 1) wr32(hdaBase, HDA_VS_EM2, rd32(hdaBase, HDA_VS_EM2) | 0x2000U);
     isCapturing = false;
     return kIOReturnSuccess;
 }

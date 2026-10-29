@@ -47,10 +47,10 @@ bool LatSOFKernelAudioDevice::initHardware(IOService *provider) {
     if (!IOAudioDevice::initHardware(provider)) return false;
     if (!owner) return false;
 
-    setDeviceName("LatSOF Internal Microphone");
+    setDeviceName("Internal Microphone (SOF DMIC)");
     setDeviceShortName("LatSOF Mic");
-    setManufacturerName("Dell Latitude 3410");
-    setDeviceModelName("LatSOF Internal Microphone");
+    setManufacturerName("Intel");
+    setDeviceModelName("SOF DMIC (Raptor Lake)");
     // Built-in transport, and see createControls(): CoreSpeech routes a
     // 'bltn' device only if its input-scope data source reads 'imic'. The
     // earlier belief that Siri filtered on device class (kernel vs

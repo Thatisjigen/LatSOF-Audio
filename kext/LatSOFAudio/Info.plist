@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.29</string>
+	<string>1.1.29-acer-rpl.5</string>
 	<key>CFBundleVersion</key>
 	<string>1.1.29</string>
 	<key>IOKitPersonalities</key>
